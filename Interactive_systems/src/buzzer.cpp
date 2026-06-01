@@ -1,4 +1,6 @@
+// buzzer.cpp
 #include <Arduino.h>
+#include "buzzer.h"
 
 #define BUZZER_PIN 1
 
@@ -7,31 +9,28 @@ int durations[] = {125, 125, 125, 125, 125, 125, 250, 125};
 int noteCount = 8;
 
 unsigned long startTime;
-unsigned long playDuration = 3000; // 5 saniye
+unsigned long playDuration = 3000;
 
 bool finished = false;
 
-void setup() {
+void buzzer_setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   startTime = millis();
 }
 
-void loop() {
+void buzzer_loop() {
   if (finished) {
     noTone(BUZZER_PIN);
     return;
   }
 
   for (int i = 0; i < noteCount; i++) {
-
-    // süre doldu kontrolü
     if (millis() - startTime >= playDuration) {
       noTone(BUZZER_PIN);
       finished = true;
       return;
     }
 
-    // nota çal
     if (melody[i] == 0) {
       noTone(BUZZER_PIN);
     } else {
