@@ -1,9 +1,8 @@
-// ldr.cpp
 #include <Arduino.h>
 #define LDR_PIN 1
 
 void ldr_setup() {
-  // ldr init buraya
+  // ldr init
 }
 
 void ldr_loop() {
@@ -13,7 +12,7 @@ void ldr_loop() {
   String tier;
   if (raw > 3000) tier = "Good";
   else if (raw > 1500) tier = "Marginal";
-  else tier = "Poor - Room too dark";
+  else tier = "Poor - Room too dark!";
 
   Serial.print("Raw: "); Serial.print(raw);
   Serial.print("  Voltage: "); Serial.print(voltage, 2);

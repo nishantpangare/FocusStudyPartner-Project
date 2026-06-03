@@ -1,4 +1,3 @@
-// buzzer.cpp
 #include <Arduino.h>
 #include "buzzer.h"
 
