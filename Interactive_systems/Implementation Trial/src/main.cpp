@@ -244,7 +244,7 @@ void showCountdown(unsigned long absentFor) {
   display.display();
 }
 
-// Just to avoid noise capture we are adding this function here so that it reads additional 8 surrounding pixels as well to reduce error margin. 
+// Just to avoid noise capture we blur using the 3x3 kernel. 
 static uint8_t blurPixel(const uint8_t* buf, int x, int y) {
   long sum = 0;
   int  cnt = 0;
