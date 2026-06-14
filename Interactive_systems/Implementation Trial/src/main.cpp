@@ -57,7 +57,7 @@ void   initNFC();
 void   initCamera();
 void   showMessage(const char* l1, const char* l2, const char* l3);
 void   showCountdown(unsigned long absentFor);
-bool   isPersonStillPresent();
+bool   checkPresence();
 void   handlePresenceMonitoring();
 
 
@@ -244,7 +244,7 @@ void showCountdown(unsigned long absentFor) {
   display.display();
 }
 
-// Just to avoid noise capture we blur using the 3x3 kernel. 
+// Just to avoid capturing noise, we blur using the 3x3 kernel. 
 static uint8_t blurPixel(const uint8_t* buf, int x, int y) {
   long sum = 0;
   int  cnt = 0;
@@ -261,7 +261,7 @@ static uint8_t blurPixel(const uint8_t* buf, int x, int y) {
 }
 
 // Presence checking function
-bool isPersonStillPresent() {
+bool checkPresence() {
   if (!baselineFrame) return false;
 
   camera_fb_t* fb = esp_camera_fb_get();
@@ -296,7 +296,7 @@ void handlePresenceMonitoring() {
   if (millis() - lastCamCheck >= CHECK_INTERVAL_MS) {
     lastCamCheck = millis();
 
-    bool present = isPersonStillPresent();
+    bool present = checkPresence();
     if (present) {
       lastFaceSeen = millis();
       if (wasAbsent) {
