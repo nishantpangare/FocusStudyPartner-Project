@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include <Wire.h>
 #include "esp_camera.h"
@@ -5,10 +6,11 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_PN532.h>
 
-Adafruit_PN532 nfc(-1, -1, &Wire);
+#define OLED_ADDRESS  0x3C
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
+Adafruit_PN532 nfc(-1, -1, &Wire);
 
-// Camera Pins
+// ───────────── CAMERA PINS (XIAO ESP32-S3) ─────────────
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM     10
@@ -26,300 +28,516 @@ Adafruit_SSD1306 display(128, 64, &Wire, -1);
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
+// ───────────── ULTRASONIC PINS ─────────────
+#define TRIG_PIN D2
+#define ECHO_PIN D3
 
-#define CHECK_INTERVAL_MS     10000  // camera check every 10 seconds
-#define ABSENCE_TIMEOUT_MS    30000  // 30 seconds absent - session paused
-#define DIFF_THRESHOLD        30     // pixel brightness change to count
-#define TOLERANCE_THRESHOLD   0.50f  // 50% change = person gone
-#define FRAME_WIDTH           320
-#define FRAME_HEIGHT          240
+// ───────────── BUZZER PIN ─────────────
+#define BUZZER_PIN D0   // I/O pin of buzzer module
 
-// ROI — region of interest (center of frame, where we assume the person is sitting in front)
+// ───────────── DURATION-SELECT BUTTON PINS ─────────────
+// NOTE: I2C (SDA/SCL) = D4/D5, TRIG=D2, ECHO=D3, BUZZER=D0,
+// and the camera FPC uses GPIO 10-18/38-40/47-48.
+// D1, D8, D9 are free on the XIAO ESP32-S3 — double check
+// against your actual board silkscreen before wiring, since
+// pin numbering can vary slightly by board revision.
+#define BTN_UP     D1
+#define BTN_DOWN   D8
+#define BTN_SELECT D9
+
+// ───────────── TUNING PARAMETERS ─────────────
+#define CHECK_INTERVAL_MS     5000  // Run the Fusion Check every 5 seconds
+#define ABSENCE_TIMEOUT_MS    30000 // Pause if missing for 30 seconds
+
+#define CAM_DIFF_THRESHOLD    30
+#define CAM_TOLERANCE_PCT     0.30f
+
 #define ROI_X   110
-#define ROI_Y    80
+#define ROI_Y   80
 #define ROI_W   100
-#define ROI_H    80
+#define ROI_H   80
 
+#define BTN_DEBOUNCE_MS       200
 
-enum State { WAITING_FOR_NFC, SHOWING_WELCOME, MONITORING_PRESENCE };
+// ───────────── STATE & GLOBALS ─────────────
+enum State { WAITING_FOR_NFC, SELECTING_DURATION, SHOWING_WELCOME, MONITORING_PRESENCE, SESSION_COMPLETE };
 State currentState = WAITING_FOR_NFC;
 
-bool          wasAbsent    = false;
-unsigned long lastFaceSeen = 0;
-unsigned long lastCamCheck = 0;
+bool          wasAbsent      = false;  // true once 30s timeout fired (session paused)
+bool          isCountingDown = false;  // true while inside the 0-30s grace window
+unsigned long lastPresence   = 0;
+unsigned long lastCheck      = 0;
 
-uint8_t* baselineFrame = nullptr;
-size_t   frameSize     = 0;
+int      baselineDistanceCM = 0;
+uint8_t* baselineFrame      = nullptr;
+size_t   frameSize          = 0;
 
+// ── Pomodoro duration menu state ──
+const int durationOptions[] = { 25, 45, 60 };  // minutes
+const int numDurationOptions = 3;
+int  selectedDurationIndex = 0;
+unsigned long lastBtnTime = 0;
 
-void   initOLED();
-void   initNFC();
-void   initCamera();
-void   showMessage(const char* l1, const char* l2, const char* l3);
-void   showCountdown(unsigned long absentFor);
-bool   checkPresence();
-void   handlePresenceMonitoring();
+unsigned long sessionDurationMs = 0;   // total target study time for this session
+unsigned long sessionStudyMs    = 0;   // accumulated *active* study time
+unsigned long lastTickMs        = 0;   // for accumulating sessionStudyMs
 
+// ───────────── FUNCTION DECLARATIONS ─────────────
+void showMessage(const char* l1, const char* l2, const char* l3);
+void showCountdown(unsigned long absentFor);
+void captureBaselines();
+bool isCameraPresent();
+bool isSonarPresent();
+void handlePresenceMonitoring();
+void buzzerBeepOnce();
+void buzzerBeepPattern(int times);
+void drawDurationMenu();
+void handleDurationMenuInput();
+void showStudyingScreen();
 
+// ───────────── SETUP ─────────────
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("Booting...");
+  delay(2000);
 
   Wire.begin(5, 6);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
 
-  initOLED();
-  initNFC();
-  initCamera();
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
 
-  showMessage("FocusStudy", "Partner", "Tap NFC");
-  Serial.println("System ready");
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("FATAL: OLED not found!");
+    while (true);
+  }
+  display.clearDisplay(); display.display();
+
+  showMessage("Booting", "Checking", "Hardware...");
+
+  nfc.begin();
+  if (!nfc.getFirmwareVersion()) {
+    showMessage("FATAL ERROR", "NFC Chip", "Dead");
+    while (true);
+  }
+  nfc.SAMConfig();
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0; config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.frame_size   = FRAMESIZE_QVGA;
+  config.fb_count     = 1;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    showMessage("FATAL ERROR", "Camera", "Init Failed");
+    while (true);
+  }
+
+  showMessage("FocusStudy", "Fusion Ready", "Tap NFC");
 }
 
-
+// ───────────── MAIN LOOP ─────────────
 void loop() {
   switch (currentState) {
+    case WAITING_FOR_NFC: {
+      uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };
+      uint8_t uidLength;
 
-    case WAITING_FOR_NFC:
-{
-    uint8_t uid[7];
-    uint8_t uidLength = 0;
-
-    if (nfc.readPassiveTargetID(
-            PN532_MIFARE_ISO14443A,
-            uid,
-            &uidLength,
-            100))
-    {
-        Serial.println("NFC tapped");
-
-        for (uint8_t i = 0; i < uidLength; i++) {
-            Serial.printf("%02X ", uid[i]);
-        }
-        Serial.println();
-
-        currentState = SHOWING_WELCOME;
+      if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 100)) {
+        selectedDurationIndex = 0;     // reset menu cursor each new tap
+        drawDurationMenu();
+        currentState = SELECTING_DURATION;
+      }
+      break;
     }
-}
-break;
 
-Serial.println("Entering SHOWING_WELCOME");
+    case SELECTING_DURATION:
+      handleDurationMenuInput();
+      break;
+
     case SHOWING_WELCOME:
-      showMessage("Welcome!", "Capturing", "baseline...");
+      showMessage("Welcome!", "Locking", "Sensors...");
       delay(2000);
 
-      {
-        camera_fb_t* fb = esp_camera_fb_get();
-        if (fb) {
-          frameSize = fb->len;
+      captureBaselines();
 
-          // Free previous allocation if session restarted
-          if (baselineFrame != nullptr) {
-            heap_caps_free(baselineFrame);
-            baselineFrame = nullptr;
-          }
+      lastPresence = millis();
+      lastCheck    = millis();
+      lastTickMs   = millis();
+      wasAbsent      = false;
+      isCountingDown = false;
+      sessionStudyMs = 0;
 
-          // We need to allocate PSRAM
-          baselineFrame = (uint8_t*)heap_caps_malloc(frameSize, MALLOC_CAP_SPIRAM);
-
-          if (baselineFrame == nullptr) {
-            Serial.println("PSRAM malloc FAILED");
-            showMessage("Memory", "FAILED", "restart board");
-            esp_camera_fb_return(fb);
-            while (true) delay(1000);
-          }
-
-          Serial.println("Capturing baseline...");
-          memcpy(baselineFrame, fb->buf, frameSize);
-          esp_camera_fb_return(fb);
-          Serial.printf("Baseline captured — %d bytes in PSRAM\n", frameSize);
-          Serial.println("Baseline capture complete");
-        } else {
-          Serial.println("Camera frame FAILED");
-          showMessage("Camera", "Error", "no frame");
-        }
-      }
-
-      lastFaceSeen = millis();
-      lastCamCheck = millis();
-      showMessage("Studying", "Active", "");
+      showStudyingScreen();
       currentState = MONITORING_PRESENCE;
       break;
 
     case MONITORING_PRESENCE:
       handlePresenceMonitoring();
       break;
+
+    case SESSION_COMPLETE: {
+      static unsigned long completeShownAt = 0;
+      if (completeShownAt == 0) {
+        showMessage("Session", "Complete!", "Nice work");
+        buzzerBeepPattern(3);
+        completeShownAt = millis();
+      }
+      // Hold the message for a few seconds, then return to NFC wait
+      if (millis() - completeShownAt > 4000) {
+        completeShownAt = 0;
+        showMessage("FocusStudy", "Fusion Ready", "Tap NFC");
+        currentState = WAITING_FOR_NFC;
+      }
+      break;
+    }
   }
 }
 
-
-void initOLED() {
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED FAILED — check wiring");
-    while (true) delay(1000);
-  }
-  display.clearDisplay();
-  display.display();
-  Serial.println("OLED ready");
-}
-
-void initNFC() {
-  nfc.begin();
-  uint32_t version = nfc.getFirmwareVersion();
-  if (!version) {
-    Serial.println("PN532 FAILED — check wiring");
-    showMessage("NFC", "FAILED", "check wiring");
-    while (true) delay(1000);
-  }
-  Serial.printf("PN532 ready — v%d.%d\n",
-    (version >> 16) & 0xFF,
-    (version >> 8)  & 0xFF);
-  nfc.SAMConfig();
-}
-
-void initCamera() {
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer  = LEDC_TIMER_0;
-  config.pin_d0  = Y2_GPIO_NUM;
-  config.pin_d1  = Y3_GPIO_NUM;
-  config.pin_d2  = Y4_GPIO_NUM;
-  config.pin_d3  = Y5_GPIO_NUM;
-  config.pin_d4  = Y6_GPIO_NUM;
-  config.pin_d5  = Y7_GPIO_NUM;
-  config.pin_d6  = Y8_GPIO_NUM;
-  config.pin_d7  = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk  = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_GRAYSCALE;
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
-
-  if (esp_camera_init(&config) != ESP_OK) {
-    Serial.println("Camera FAILED — check expansion board");
-    showMessage("Camera", "FAILED", "check board");
-    while (true) delay(1000);
-  }
-  Serial.println("Camera ready");
-}
-
-// Display Message function
-void showMessage(const char* l1, const char* l2, const char* l3) {
+// ───────────── DURATION SELECTION MENU ─────────────
+void drawDurationMenu() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(0, 5);
-  display.println(l1);
   display.setTextSize(1);
-  display.setCursor(0, 35);
-  display.println(l2);
-  display.setCursor(0, 50);
-  display.println(l3);
+  display.setCursor(0, 0);
+  display.println("Select Duration:");
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+  for (int i = 0; i < numDurationOptions; i++) {
+    int y = 18 + (i * 14);
+    display.setCursor(10, y);
+    display.print(i == selectedDurationIndex ? "> " : "  ");
+    display.print(durationOptions[i]);
+    display.println(" min");
+  }
+  display.display();
+}
+
+void handleDurationMenuInput() {
+  unsigned long now = millis();
+  if (now - lastBtnTime < BTN_DEBOUNCE_MS) return;
+
+  if (digitalRead(BTN_UP) == LOW) {
+    selectedDurationIndex = (selectedDurationIndex - 1 + numDurationOptions) % numDurationOptions;
+    drawDurationMenu();
+    lastBtnTime = now;
+  } else if (digitalRead(BTN_DOWN) == LOW) {
+    selectedDurationIndex = (selectedDurationIndex + 1) % numDurationOptions;
+    drawDurationMenu();
+    lastBtnTime = now;
+  } else if (digitalRead(BTN_SELECT) == LOW) {
+    sessionDurationMs = (unsigned long)durationOptions[selectedDurationIndex] * 60UL * 1000UL;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Session set:");
+    display.setTextSize(2);
+    display.setCursor(10, 25);
+    display.print(durationOptions[selectedDurationIndex]);
+    display.println(" min");
+    display.display();
+    delay(1000);
+
+    lastBtnTime = now;
+    currentState = SHOWING_WELCOME;
+  }
+}
+
+// ───────────── BUZZER UTIL ─────────────
+void buzzerBeepOnce() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void buzzerBeepPattern(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(150);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(150);
+  }
+}
+
+
+// ── Cat animation frame bitmaps (8x8 pixel art) ──────────────
+// Frame 1 — legs forward
+const uint8_t CAT_FRAME1[] PROGMEM = {
+  0b00111100,
+  0b01111110,
+  0b01011010,
+  0b01111110,
+  0b00111100,
+  0b00111100,
+  0b01000010,
+  0b01000010
+};
+
+// Frame 2 — legs back
+const uint8_t CAT_FRAME2[] PROGMEM = {
+  0b00111100,
+  0b01111110,
+  0b01011010,
+  0b01111110,
+  0b00111100,
+  0b00111100,
+  0b00100100,
+  0b00100100
+};
+
+// ── Cat walk state ────────────────────────────────────────────
+int catX          = 0;
+int catFrame      = 0;
+int catDirection  = 1;           // 1 = right, -1 = left
+unsigned long lastCatMove = 0;
+
+void showStudyingScreen() {
+  unsigned long now = millis();
+
+  // Calculate remaining time
+  unsigned long elapsed  = sessionStudyMs;
+  unsigned long totalMs  = sessionDurationMs;
+  unsigned long remaining = (totalMs > elapsed) ? (totalMs - elapsed) : 0;
+
+  unsigned long remainMins = remaining / 60000;
+  unsigned long remainSecs = (remaining % 60000) / 1000;
+
+  display.clearDisplay();
+
+  // ── "STUDYING" label top left ──
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print("STUDYING");
+
+  // ── Big timer in center ──
+  display.setTextSize(3);
+  display.setCursor(14, 18);
+  if (remainMins < 10) display.print("0");
+  display.print(remainMins);
+  display.print(":");
+  if (remainSecs < 10) display.print("0");
+  display.print(remainSecs);
+
+  // ── Animate cat ──
+  // Move cat every 150ms
+  if (now - lastCatMove > 150) {
+    lastCatMove = now;
+    catX += catDirection * 2;
+    catFrame = !catFrame;
+
+    // Bounce at edges
+    if (catX > 100) catDirection = -1;
+    if (catX < 0)   catDirection =  1;
+  }
+
+  // Draw cat body (8x8 bitmap, scaled x1)
+  if (catFrame == 0) {
+    display.drawBitmap(catX, 55, CAT_FRAME1, 8, 8, SSD1306_WHITE);
+  } else {
+    display.drawBitmap(catX, 55, CAT_FRAME2, 8, 8, SSD1306_WHITE);
+  }
+
+  display.display();
+}
+
+void showMessage(const char* l1, const char* l2, const char* l3) {
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2); display.setCursor(0, 5); display.println(l1);
+  display.setTextSize(1); display.setCursor(0, 35); display.println(l2);
+  display.setCursor(0, 50); display.println(l3);
   display.display();
 }
 
 void showCountdown(unsigned long absentFor) {
-  unsigned long remaining = 0;
-  if (ABSENCE_TIMEOUT_MS > absentFor)
-    remaining = (ABSENCE_TIMEOUT_MS - absentFor) / 1000;
-
+  unsigned long remaining = (ABSENCE_TIMEOUT_MS > absentFor) ? (ABSENCE_TIMEOUT_MS - absentFor) / 1000 : 0;
   display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("Are you there?");
-  display.setTextSize(2);
-  display.setCursor(0, 20);
-  display.printf("%lus left", remaining);
-  display.setTextSize(1);
-  display.setCursor(0, 52);
-  display.println("Come back to resume");
+  display.setTextSize(1); display.setCursor(0, 0); display.println("Are you there?");
+  display.setTextSize(2); display.setCursor(0, 20); display.printf("%lus", remaining);
   display.display();
 }
 
-// Just to avoid capturing noise, we blur using the 3x3 kernel. 
+// ───────────── SENSOR CAPTURE & LOGIC ─────────────
+void captureBaselines() {
+  long total = 0; int validReadings = 0;
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10); digitalWrite(TRIG_PIN, LOW);
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+    int d = (duration == 0) ? 999 : duration * 0.034 / 2;
+    if (d < 400) { total += d; validReadings++; }
+    delay(50);
+  }
+  baselineDistanceCM = (validReadings > 0) ? (total / validReadings) : 50;
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (fb) {
+    frameSize = fb->len;
+    if (baselineFrame == nullptr) baselineFrame = (uint8_t*)malloc(frameSize);
+    memcpy(baselineFrame, fb->buf, frameSize);
+    esp_camera_fb_return(fb);
+  }
+
+  Serial.println("\n=== BASELINES LOCKED ===");
+  Serial.printf("SONAR Baseline  : %d cm\n", baselineDistanceCM);
+  Serial.printf("CAMERA Baseline : Frame Captured (%d bytes)\n", frameSize);
+  Serial.println("========================\n");
+}
+
+int calculateDynamicTolerance(int baseline) {
+  int tolerance = baseline * 0.25;
+  return (tolerance < 15) ? 15 : tolerance;
+}
+
+bool isSonarPresent() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10); digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  int currentDistance = (duration == 0) ? 999 : duration * 0.034 / 2;
+
+  if (currentDistance >= 999) return false;
+
+  int dynamicTolerance = calculateDynamicTolerance(baselineDistanceCM);
+  int upperBound = baselineDistanceCM + dynamicTolerance;
+  int lowerBound = 10;
+
+  bool isSafe = (currentDistance >= lowerBound && currentDistance <= upperBound);
+
+  Serial.printf("SONAR  -> Baseline: %dcm | Current: %dcm | Zone: %dcm to %dcm | Status: %s\n",
+                baselineDistanceCM, currentDistance, lowerBound, upperBound, isSafe ? "SAFE" : "TRIPPED");
+
+  return isSafe;
+}
+
 static uint8_t blurPixel(const uint8_t* buf, int x, int y) {
-  long sum = 0;
-  int  cnt = 0;
+  long sum = 0; int cnt = 0;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       int nx = x + dx, ny = y + dy;
-      if (nx >= 0 && nx < FRAME_WIDTH && ny >= 0 && ny < FRAME_HEIGHT) {
-        sum += buf[ny * FRAME_WIDTH + nx];
-        cnt++;
+      if (nx >= 0 && nx < 320 && ny >= 0 && ny < 240) {
+        sum += buf[ny * 320 + nx]; cnt++;
       }
     }
   }
-  return (uint8_t)(sum / cnt);
+  return sum / cnt;
 }
 
-// Presence checking function
-bool checkPresence() {
+bool isCameraPresent() {
   if (!baselineFrame) return false;
-
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) return false;
 
   long changedPixels = 0;
-  long totalPixels   = ROI_W * ROI_H;
-
   for (int y = ROI_Y; y < ROI_Y + ROI_H; y++) {
     for (int x = ROI_X; x < ROI_X + ROI_W; x++) {
-      uint8_t cur  = blurPixel(fb->buf,       x, y);
+      uint8_t cur  = blurPixel(fb->buf, x, y);
       uint8_t base = blurPixel(baselineFrame, x, y);
-      if (abs((int)cur - (int)base) > DIFF_THRESHOLD)
-        changedPixels++;
+      if (abs((int)cur - (int)base) > CAM_DIFF_THRESHOLD) changedPixels++;
     }
   }
-
   esp_camera_fb_return(fb);
 
-  float ratio = (float)changedPixels / totalPixels;
-  Serial.printf("Baseline diff: %.1f%% | %s\n",
-    ratio * 100,
-    ratio < TOLERANCE_THRESHOLD ? "PRESENT" : "ABSENT");
+  float ratio = (float)changedPixels / (ROI_W * ROI_H);
+  bool isSafe = (ratio < CAM_TOLERANCE_PCT);
 
-  return ratio < TOLERANCE_THRESHOLD;
+  Serial.printf("CAMERA -> Changed Pixels: %.1f%% | Allowed Change: %.1f%% | Status: %s\n",
+                (ratio * 100), (CAM_TOLERANCE_PCT * 100), isSafe ? "SAFE" : "TRIPPED");
+
+  return isSafe;
 }
 
-
+// ───────────── SENSOR FUSION MANAGER ─────────────
 void handlePresenceMonitoring() {
 
-  // Camera check every 10 seconds
-  if (millis() - lastCamCheck >= CHECK_INTERVAL_MS) {
-    lastCamCheck = millis();
+  // ── Accumulate active study time (paused time doesn't count) ──
+  unsigned long now = millis();
+  if (!wasAbsent) {
+    sessionStudyMs += (now - lastTickMs);
+  }
+  lastTickMs = now;
 
-    bool present = checkPresence();
+  // ── Session duration reached → wrap up ──
+  if (sessionDurationMs > 0 && sessionStudyMs >= sessionDurationMs) {
+    currentState = SESSION_COMPLETE;
+    return;
+  }
+
+  // ── If session is already PAUSED, wait for NFC tap to resume ──
+  if (wasAbsent) {
+    uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };
+    uint8_t uidLength;
+    if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 100)) {
+      wasAbsent      = false;
+      isCountingDown = false;
+      showMessage("Welcome", "back!", "Resuming...");
+      delay(1500);
+      captureBaselines();
+      lastPresence = millis(); lastCheck = millis(); lastTickMs = millis();
+      showStudyingScreen();
+    }
+    return; // don't run fusion checks while paused
+  }
+
+  // ── Run the fusion check every CHECK_INTERVAL_MS ──
+  if (millis() - lastCheck >= CHECK_INTERVAL_MS) {
+    lastCheck = millis();
+
+    Serial.println("\n--- FUSION CHECK ---");
+    bool sonarSafe  = isSonarPresent();
+    bool cameraSafe = isCameraPresent();
+    bool present    = sonarSafe || cameraSafe;
+
+    Serial.printf("FUSION RESULT -> Depth: [%s] | Movement: [%s] | Present: %s\n",
+                  sonarSafe ? "PRESENT" : "ABSENT",
+                  cameraSafe ? "PRESENT" : "ABSENT",
+                  present ? "YES" : "NO");
+
     if (present) {
-      lastFaceSeen = millis();
-      if (wasAbsent) {
-        wasAbsent = false;
-        showMessage("Welcome", "back!", "");
-        delay(1500);
+      lastPresence = millis();
+
+      if (isCountingDown) {
+        isCountingDown = false;
+        Serial.println("User returned within grace period");
       }
-      showMessage("Studying", "Active", "");
+
+      showStudyingScreen();
     }
   }
 
+  // ── Track how long the user has been absent ──
+  unsigned long timeSinceLastSeen = millis() - lastPresence;
 
-  unsigned long timeSinceLastSeen = millis() - lastFaceSeen;
-
-  if (timeSinceLastSeen > CHECK_INTERVAL_MS) {
-    if (timeSinceLastSeen >= ABSENCE_TIMEOUT_MS) {
-      if (!wasAbsent) {
-        wasAbsent = true;
-        showMessage("Session", "Paused", "Button Functionality Pending To Resume Session");
-        Serial.println("Session paused — absent too long");
-      }
-    } else {
-      showCountdown(timeSinceLastSeen);
+if (timeSinceLastSeen > CHECK_INTERVAL_MS) {
+  if (timeSinceLastSeen >= ABSENCE_TIMEOUT_MS) {
+    if (!wasAbsent) {
+      wasAbsent      = true;
+      isCountingDown = false;
+      showMessage("Session", "Paused", "Tap NFC to resume");
+      Serial.println("SYSTEM: Session Paused. Waiting for NFC...");
     }
+  } else {
+    if (!isCountingDown) {
+      isCountingDown = true;
+      buzzerBeepOnce();
+      Serial.println("User missing — single beep, countdown started");
+    }
+    showCountdown(timeSinceLastSeen);
   }
+} else {
+  // Person present — update screen every single loop tick
+  showStudyingScreen();
+}
 }
